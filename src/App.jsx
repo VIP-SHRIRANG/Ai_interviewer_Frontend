@@ -110,6 +110,7 @@ export default function App() {
   );
 
   const clientRef = useRef(null);
+  const submitAnswerRef = useRef(null); //Added a ref to hold the submitAnswer function for use in the inactivity timer callback
   const audioRef = useRef(null);
   const speechRef = useRef(null);
   const inactivityTimerRef = useRef(null);
@@ -158,7 +159,7 @@ export default function App() {
         ...previous,
         questionNumber,
         totalQuestions,
-        score: data.score ?? data.totalScore ?? previous.score,
+        score: data.score ?? data.totalScore ?? data.averageScore ?? previous.score, // Updated to include averageScore as a fallback for score
         progress:
           data.progress ??
           (questionNumber && totalQuestions
@@ -178,8 +179,6 @@ export default function App() {
       clearAnswerTimer();
 
       setQuestion(nextQuestion);
-      setFeedback(null);
-      setAnswerOutput("");
       updateAnswer("");
 
       updateMetrics({
@@ -468,12 +467,11 @@ export default function App() {
 
       if (result?.question || result?.data?.question) {
         handleQuestion(result?.data ?? result);
-      } else {
-        setSessionStatus((previous) =>
-          previous === "starting" ? "active" : previous
-        );
+      } else if (!result?.streamed) {
+        setSessionStatus((previous) => (previous === "starting" ? "active" : previous));
         setStatusMessage("Interview started. Waiting for a question...");
       }
+
     } catch (err) {
       setSessionStatus("idle");
       setIsStarting(false);
@@ -510,6 +508,9 @@ export default function App() {
       return;
     }
 
+    try { speechRef.current?.stop?.(); } catch {}
+    setIsListening(false);
+
     sessionIdRef.current = sessionId;
     submittingRef.current = true;
     setError("");
@@ -536,13 +537,13 @@ export default function App() {
         handleSessionCompleted(result);
       }
 
+
+      //Updated has result check to include streamed, feedback, evaluation, question, data.question, completed, and sessionCompleted
       const hasResult =
-        result?.feedback ||
-        result?.evaluation ||
-        result?.question ||
-        result?.data?.question ||
-        result?.completed ||
-        result?.sessionCompleted;
+        result?.streamed ||
+        result?.feedback || result?.evaluation ||
+        result?.question || result?.data?.question ||
+        result?.completed || result?.sessionCompleted;
 
       if (!hasResult) {
         setIsSubmitting(false);
@@ -638,6 +639,7 @@ export default function App() {
     }
 
     setError("");
+    const baseText = answerRef.current; // Store the current answer text to append recognized speech to it
 
     try {
       speech.start(
@@ -651,14 +653,15 @@ export default function App() {
 
     if (!text.trim()) return;
 
-    updateAnswer(text.trim());
+    // Update the answer with the recognized text and reset the inactivity timer
+    updateAnswer((answerRef.current + " " + text).trim());
     clearAnswerTimer();
 
+    //Updated inactivity timer to 3 seconds instead of 5 seconds for automatic submission of answer
     inactivityTimerRef.current = setTimeout(() => {
-      if (mountedRef.current) {
-        submitAnswer({ automatic: true });
-      }
+      if (mountedRef.current) submitAnswerRef.current({ automatic: true });
     }, 3000);
+
   },
   (message) => {
     if (!mountedRef.current) return;
