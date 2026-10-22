@@ -34,6 +34,8 @@ const INITIAL_METRICS = {
   progress: 0,
 };
 
+const AUTO_SUBMIT_DELAY_MS = 5000;
+
 function getMessage(error) {
   if (typeof error === "string") return error;
   return error?.message || "Something went wrong. Please try again.";
@@ -643,34 +645,26 @@ export default function App() {
 
     try {
       speech.start(
-  (recognizedText) => {
-    if (!mountedRef.current) return;
+        (recognizedText) => {
+          if (!mountedRef.current || submittingRef.current) return;
 
-    const text =
-      typeof recognizedText === "string"
-        ? recognizedText
-        : recognizedText?.transcript ?? "";
+          const text =
+            typeof recognizedText === "string"
+              ? recognizedText
+              : recognizedText?.transcript ?? "";
 
-    if (!text.trim()) return;
+          if (!text.trim()) return;
 
-    // Update the answer with the recognized text and reset the inactivity timer
-    updateAnswer((answerRef.current + " " + text).trim());
-    clearAnswerTimer();
+          updateAnswer((baseText + " " + text).trim());
+        },
+        (message) => {
+          if (!mountedRef.current) return;
 
-    //Updated inactivity timer to 3 seconds instead of 5 seconds for automatic submission of answer
-    inactivityTimerRef.current = setTimeout(() => {
-      if (mountedRef.current) submitAnswerRef.current({ automatic: true });
-    }, 3000);
-
-  },
-  (message) => {
-    if (!mountedRef.current) return;
-
-    setIsListening(false);
-    setError(message);
-    setStatusMessage("Microphone stopped. Check the error message.");
-  }
-);
+          setIsListening(false);
+          setError(message);
+          setStatusMessage("Microphone stopped. Check the error message.");
+        }
+      );
 
       setIsListening(true);
       setStatusMessage("Listening... speak your answer.");
@@ -680,8 +674,22 @@ export default function App() {
     }
   }
 
+  submitAnswerRef.current = submitAnswer;
   const isActive = sessionStatus === "active";
   const isBusy = isStarting || isSubmitting || isFinishing;
+
+  //Adding a useEffect to automatically submit the answer after a period of inactivity (3 seconds) when the user is actively answering a question. This will help in scenarios where the user stops typing or speaking, and we want to automatically submit their answer for evaluation.
+  useEffect(() => {
+    // Only count down when there is an answer and nothing is in progress
+    if (!isActive || isBusy || !answer.trim()) return;
+
+    const timer = setTimeout(() => {
+      submitAnswerRef.current?.({ automatic: true });
+    }, AUTO_SUBMIT_DELAY_MS);
+
+    // Any change to `answer` (typing or speech) cancels this and starts a new one
+    return () => clearTimeout(timer);
+  }, [answer, isActive, isBusy]);    
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800">
