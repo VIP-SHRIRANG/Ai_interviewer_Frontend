@@ -34,6 +34,7 @@ const INITIAL_METRICS = {
   progress: 0,
 };
 
+// Set the auto-submit delay to 5 seconds (5000 milliseconds)
 const AUTO_SUBMIT_DELAY_MS = 5000;
 
 function getMessage(error) {
