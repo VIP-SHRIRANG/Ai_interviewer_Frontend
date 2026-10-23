@@ -5,6 +5,7 @@ const PATHS = {
   topics: "/interview/topics",
   start: "/interview/start",
   answer: "/interview/answer",
+  options: "/interview/options",
   finish: "/interview/finish",
   report: (id) => `/interview/report/${id}`,
 };
@@ -29,20 +30,35 @@ export class InterviewClient {
     this.onError = null;
   }
 
-  async fetchTopics() {
-    const res = await fetch(`${BASE_URL}${PATHS.topics}`);
-    if (!res.ok) throw new Error(`Topics failed (${res.status}): ${await readError(res)}`);
-    return res.json(); // { topics: [...] }
-  }
+  // async fetchTopics() {
+  //   const res = await fetch(`${BASE_URL}${PATHS.topics}`);
+  //   if (!res.ok) throw new Error(`Topics failed (${res.status}): ${await readError(res)}`);
+  //   return res.json(); // { topics: [...] }
+  // }
 
-  async startInterview({ topic, difficulty, maxQuestions, candidateName }) {
-    this.sessionId = null;
-    return this._stream(
-      PATHS.start,
-      { topic, difficulty, maxQuestions, candidateName },
-      { resolveOnSession: true }
-    );
-  }
+  async fetchOptions() {
+  const res = await fetch(`${BASE_URL}${PATHS.options}`);
+  if (!res.ok) throw new Error(`Options failed (${res.status}): ${await readError(res)}`);
+  return res.json();   // { companies: [...], roles: [...] }
+}
+
+async startInterview({ company, role, round, maxQuestions, candidateName }) {
+  this.sessionId = null;
+  return this._stream(
+    PATHS.start,
+    { company, role, round, topic: role, maxQuestions, candidateName },
+    { resolveOnSession: true }
+  );
+}
+
+  // async startInterview({ topic, difficulty, maxQuestions, candidateName }) {
+  //   this.sessionId = null;
+  //   return this._stream(
+  //     PATHS.start,
+  //     { topic, difficulty, maxQuestions, candidateName },
+  //     { resolveOnSession: true }
+  //   );
+  // }
 
   async submitAnswer(sessionId, answer) {
     return this._stream(PATHS.answer, { sessionId, answer });
