@@ -5,26 +5,35 @@ import { SpeechRecognitionService } from "./services/speechRecognition.js";
 
 const INITIAL_FORM = {
   candidateName: "",
-  topic: "",
-  difficulty: "Medium",
+  company: "",
+  role: "",
   maxQuestions: 5,
 };
 
-const DEFAULT_TOPICS = [
-  "JavaScript",
-  "React",
-  "Node.js",
-  "Express.js",
-  "MongoDB",
-  "Java",
-  "Python",
-  "SQL",
-  "Data Structures and Algorithms",
-  "OOP",
-  "DBMS",
-  "Operating Systems",
-  "Computer Networks",
-  "Full Stack Development",
+// Fallback lists, replaced by the backend's /interview/options when available
+const DEFAULT_COMPANIES = [
+  "nCircle",
+  "TCS",
+  "Infosys",
+  "Wipro",
+  "Accenture",
+  "Capgemini",
+  "Cognizant",
+  "Amazon",
+  "Microsoft",
+  "Google",
+];
+
+const DEFAULT_ROLES = [
+  "Backend Developer",
+  "Frontend Developer",
+  "Full Stack Developer",
+  "Software Engineer",
+  "Android Developer",
+  "Data Analyst",
+  "Data Scientist",
+  "DevOps Engineer",
+  "QA Engineer",
 ];
 
 const INITIAL_METRICS = {
@@ -34,7 +43,7 @@ const INITIAL_METRICS = {
   progress: 0,
 };
 
-// Set the auto-submit delay to 5 seconds (5000 milliseconds)
+// Auto-submit after this much inactivity (typing or speaking)
 const AUTO_SUBMIT_DELAY_MS = 5000;
 
 function getMessage(error) {
@@ -42,29 +51,43 @@ function getMessage(error) {
   return error?.message || "Something went wrong. Please try again.";
 }
 
-function getTopicValue(item) {
+function getOptionValue(item) {
   if (typeof item === "string") return item.trim();
 
   if (item && typeof item === "object") {
     return String(
-      item.value ?? item.topic ?? item.name ?? item.label ?? ""
+      item.value ?? item.id ?? item.name ?? item.label ?? ""
     ).trim();
   }
 
   return "";
 }
 
-function getTopicLabel(item) {
+function getOptionLabel(item) {
   if (typeof item === "string") return item.trim();
 
   if (item && typeof item === "object") {
     return String(
-      item.label ?? item.name ?? item.topic ?? item.value ?? ""
+      item.label ?? item.name ?? item.value ?? item.id ?? ""
     ).trim();
   }
 
   return "";
 }
+
+function toOptions(list) {
+  if (!Array.isArray(list)) return [];
+
+  return list
+    .map((item) => ({
+      value: getOptionValue(item),
+      label: getOptionLabel(item),
+    }))
+    .filter((item) => item.value);
+}
+
+const DEFAULT_COMPANY_OPTIONS = toOptions(DEFAULT_COMPANIES);
+const DEFAULT_ROLE_OPTIONS = toOptions(DEFAULT_ROLES);
 
 function extractText(data) {
   if (typeof data === "string") return data;
@@ -91,8 +114,9 @@ function getSessionId(data) {
 
 export default function App() {
   const [form, setForm] = useState(INITIAL_FORM);
-  const [topics, setTopics] = useState(DEFAULT_TOPICS);
-  const [topicsLoaded, setTopicsLoaded] = useState(false);
+  const [companies, setCompanies] = useState(DEFAULT_COMPANY_OPTIONS);
+  const [roles, setRoles] = useState(DEFAULT_ROLE_OPTIONS);
+  const [optionsLoaded, setOptionsLoaded] = useState(false);
 
   const [sessionStatus, setSessionStatus] = useState("idle");
   const [question, setQuestion] = useState("");
@@ -102,18 +126,19 @@ export default function App() {
   const [summary, setSummary] = useState(null);
 
   const [metrics, setMetrics] = useState(INITIAL_METRICS);
-  const [isLoadingTopics, setIsLoadingTopics] = useState(true);
+  const [isLoadingOptions, setIsLoadingOptions] = useState(true);
   const [isStarting, setIsStarting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isFinishing, setIsFinishing] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [error, setError] = useState("");
   const [statusMessage, setStatusMessage] = useState(
-    "Configure your interview and select Start Interview."
+    "Choose a company and role, then select Start Interview."
   );
 
   const clientRef = useRef(null);
-  const submitAnswerRef = useRef(null); //Added a ref to hold the submitAnswer function for use in the inactivity timer callback
+  const submitAnswerRef = useRef(null);
   const audioRef = useRef(null);
   const speechRef = useRef(null);
   const inactivityTimerRef = useRef(null);
@@ -162,7 +187,11 @@ export default function App() {
         ...previous,
         questionNumber,
         totalQuestions,
-        score: data.score ?? data.totalScore ?? data.averageScore ?? previous.score, // Updated to include averageScore as a fallback for score
+        score:
+          data.score ??
+          data.totalScore ??
+          data.averageScore ??
+          previous.score,
         progress:
           data.progress ??
           (questionNumber && totalQuestions
@@ -267,11 +296,12 @@ export default function App() {
     setIsSubmitting(false);
     setIsFinishing(false);
     setIsListening(false);
+    setIsTranscribing(false);
     submittingRef.current = false;
     setStatusMessage("Interview completed.");
 
     try {
-      speechRef.current?.stop?.();
+      speechRef.current?.cancel?.();
     } catch {
       // Ignore speech cleanup errors.
     }
@@ -312,7 +342,7 @@ export default function App() {
       clearAnswerTimer();
 
       try {
-        speechRef.current?.stop?.();
+        speechRef.current?.cancel?.();
         audioRef.current?.stop?.();
       } catch {
         // Ignore cleanup errors.
@@ -334,56 +364,43 @@ export default function App() {
     handleError,
   ]);
 
+  // Load company / role lists from the backend (falls back to the defaults)
   useEffect(() => {
     let cancelled = false;
 
-    async function loadTopics() {
-      setIsLoadingTopics(true);
+    async function loadOptions() {
+      setIsLoadingOptions(true);
 
       try {
-        const result = await clientRef.current.fetchTopics();
+        const result = await clientRef.current.fetchOptions?.();
 
         if (cancelled) return;
 
-        let list = Array.isArray(result)
-          ? result
-          : result?.topics ?? result?.data?.topics ?? [];
+        const companyList = toOptions(
+          result?.companies ?? result?.data?.companies
+        );
+        const roleList = toOptions(result?.roles ?? result?.data?.roles);
 
-        list = list
-          .map((item) => ({
-            value: getTopicValue(item),
-            label: getTopicLabel(item),
-          }))
-          .filter((item) => item.value);
-
-        if (list.length > 0) {
-          setTopics(list);
-
-          setForm((previous) => ({
-            ...previous,
-            topic: list.some((item) => item.value === previous.topic)
-              ? previous.topic
-              : "",
-          }));
-        } else {
-          setTopics(DEFAULT_TOPICS);
-        }
-
-        setTopicsLoaded(true);
+        setCompanies(
+          companyList.length > 0 ? companyList : DEFAULT_COMPANY_OPTIONS
+        );
+        setRoles(roleList.length > 0 ? roleList : DEFAULT_ROLE_OPTIONS);
+        setOptionsLoaded(true);
       } catch (err) {
         if (cancelled) return;
 
-        setTopics(DEFAULT_TOPICS);
-        setTopicsLoaded(true);
+        setCompanies(DEFAULT_COMPANY_OPTIONS);
+        setRoles(DEFAULT_ROLE_OPTIONS);
+        setOptionsLoaded(true);
         setError(
-          `Could not load topics from the backend. Default topics are available. ${getMessage(err)}`
+          `Could not load companies and roles from the backend. Default lists are available. ${getMessage(err)}`
         );
       } finally {
-        if (!cancelled) setIsLoadingTopics(false);
+        if (!cancelled) setIsLoadingOptions(false);
       }
     }
 
-    loadTopics();
+    loadOptions();
 
     return () => {
       cancelled = true;
@@ -398,7 +415,7 @@ export default function App() {
       [name]: name === "maxQuestions" ? Number(value) : value,
     }));
 
-    if (name === "topic" && value.trim()) {
+    if ((name === "company" || name === "role") && value.trim()) {
       setError("");
     }
   }
@@ -409,15 +426,21 @@ export default function App() {
     if (isStarting || sessionStatus === "active") return;
 
     const candidateName = form.candidateName.trim();
-    const selectedTopic = String(form.topic ?? "").trim();
+    const selectedCompany = String(form.company ?? "").trim();
+    const selectedRole = String(form.role ?? "").trim();
 
     if (!candidateName) {
       setError("Please enter your name.");
       return;
     }
 
-    if (!selectedTopic) {
-      setError("Please select an interview topic.");
+    if (!selectedCompany) {
+      setError("Please select a company.");
+      return;
+    }
+
+    if (!selectedRole) {
+      setError("Please select a role.");
       return;
     }
 
@@ -446,8 +469,8 @@ export default function App() {
 
     try {
       const result = await clientRef.current.startInterview({
-        topic: selectedTopic,
-        difficulty: form.difficulty,
+        company: selectedCompany,
+        role: selectedRole,
         maxQuestions: form.maxQuestions,
         candidateName,
       });
@@ -471,10 +494,11 @@ export default function App() {
       if (result?.question || result?.data?.question) {
         handleQuestion(result?.data ?? result);
       } else if (!result?.streamed) {
-        setSessionStatus((previous) => (previous === "starting" ? "active" : previous));
+        setSessionStatus((previous) =>
+          previous === "starting" ? "active" : previous
+        );
         setStatusMessage("Interview started. Waiting for a question...");
       }
-
     } catch (err) {
       setSessionStatus("idle");
       setIsStarting(false);
@@ -511,8 +535,13 @@ export default function App() {
       return;
     }
 
-    try { speechRef.current?.stop?.(); } catch {}
+    try {
+      speechRef.current?.cancel?.();
+    } catch {
+      // Ignore speech cleanup errors.
+    }
     setIsListening(false);
+    setIsTranscribing(false);
 
     sessionIdRef.current = sessionId;
     submittingRef.current = true;
@@ -540,13 +569,14 @@ export default function App() {
         handleSessionCompleted(result);
       }
 
-
-      //Updated has result check to include streamed, feedback, evaluation, question, data.question, completed, and sessionCompleted
       const hasResult =
         result?.streamed ||
-        result?.feedback || result?.evaluation ||
-        result?.question || result?.data?.question ||
-        result?.completed || result?.sessionCompleted;
+        result?.feedback ||
+        result?.evaluation ||
+        result?.question ||
+        result?.data?.question ||
+        result?.completed ||
+        result?.sessionCompleted;
 
       if (!hasResult) {
         setIsSubmitting(false);
@@ -566,23 +596,20 @@ export default function App() {
     const sessionId =
       sessionIdRef.current ?? clientRef.current?.sessionId;
 
-    if (
-      isFinishing ||
-      !sessionId ||
-      sessionStatus !== "active"
-    ) {
+    if (isFinishing || !sessionId || sessionStatus !== "active") {
       return;
     }
 
     clearAnswerTimer();
 
     try {
-      speechRef.current?.stop?.();
+      speechRef.current?.cancel?.();
     } catch {
       // Ignore speech cleanup errors.
     }
 
     setIsListening(false);
+    setIsTranscribing(false);
     setIsFinishing(true);
     setError("");
     setStatusMessage("Finishing your interview...");
@@ -620,19 +647,11 @@ export default function App() {
     }
   }
 
-  function toggleSpeechRecognition() {
+  async function toggleSpeechRecognition() {
     const speech = speechRef.current;
 
     if (isListening) {
-      try {
-        speech?.stop?.();
-      } catch {
-        // Ignore stop errors.
-      }
-
-      setIsListening(false);
-      clearAnswerTimer();
-      setStatusMessage("Microphone stopped.");
+      speech?.stop(); // finish recording, then transcribe
       return;
     }
 
@@ -642,18 +661,12 @@ export default function App() {
     }
 
     setError("");
-    const baseText = answerRef.current; // Store the current answer text to append recognized speech to it
+    const baseText = answerRef.current;
 
     try {
-      speech.start(
-        (recognizedText) => {
+      await speech.start(
+        (text) => {
           if (!mountedRef.current || submittingRef.current) return;
-
-          const text =
-            typeof recognizedText === "string"
-              ? recognizedText
-              : recognizedText?.transcript ?? "";
-
           if (!text.trim()) return;
 
           updateAnswer((baseText + " " + text).trim());
@@ -661,36 +674,44 @@ export default function App() {
         (message) => {
           if (!mountedRef.current) return;
 
-          setIsListening(false);
           setError(message);
           setStatusMessage("Microphone stopped. Check the error message.");
+        },
+        (state) => {
+          if (!mountedRef.current) return;
+
+          setIsListening(state === "recording");
+          setIsTranscribing(state === "transcribing");
+
+          if (state === "recording") {
+            setStatusMessage("Listening... speak your answer.");
+          }
+          if (state === "transcribing") {
+            setStatusMessage("Transcribing your answer...");
+          }
         }
       );
-
-      setIsListening(true);
-      setStatusMessage("Listening... speak your answer.");
     } catch (err) {
-      setIsListening(false);
       setError(getMessage(err));
     }
   }
 
   submitAnswerRef.current = submitAnswer;
-  const isActive = sessionStatus === "active";
-  const isBusy = isStarting || isSubmitting || isFinishing;
 
-  //Adding a useEffect to automatically submit the answer after a period of inactivity (3 seconds) when the user is actively answering a question. This will help in scenarios where the user stops typing or speaking, and we want to automatically submit their answer for evaluation.
+  const isActive = sessionStatus === "active";
+  const isBusy = isStarting || isSubmitting || isFinishing || isTranscribing;
+
+  // Auto-submit after a period of inactivity (typing or speaking)
   useEffect(() => {
-    // Only count down when there is an answer and nothing is in progress
-    if (!isActive || isBusy || !answer.trim()) return;
+    if (!isActive || isBusy || isListening || !answer.trim()) return;
 
     const timer = setTimeout(() => {
       submitAnswerRef.current?.({ automatic: true });
     }, AUTO_SUBMIT_DELAY_MS);
 
-    // Any change to `answer` (typing or speech) cancels this and starts a new one
+    // Any change to `answer` cancels this timer and starts a new one
     return () => clearTimeout(timer);
-  }, [answer, isActive, isBusy]);    
+  }, [answer, isActive, isBusy, isListening]);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800">
@@ -721,7 +742,7 @@ export default function App() {
             Prepare for your next interview
           </h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
-            Choose a topic and difficulty, answer questions, and review your interview feedback.
+            Choose a company and role, answer questions, and review your interview feedback.
           </p>
         </div>
 
@@ -765,58 +786,57 @@ export default function App() {
               </div>
 
               <div>
-                <label htmlFor="topic" className="mb-2 block text-sm font-semibold text-slate-700">
-                  Interview topic
+                <label htmlFor="company" className="mb-2 block text-sm font-semibold text-slate-700">
+                  Company
                 </label>
                 <select
-                  id="topic"
-                  name="topic"
-                  value={form.topic}
+                  id="company"
+                  name="company"
+                  value={form.company}
                   onChange={handleFormChange}
                   disabled={isActive || isStarting}
                   className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-3 text-sm outline-none transition focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:bg-slate-100"
                   required
                 >
                   <option value="">
-                    {isLoadingTopics ? "Loading topics..." : "Select a topic"}
+                    {isLoadingOptions ? "Loading companies..." : "Select a company"}
                   </option>
-                  {topics.map((item, index) => {
-                    const value = getTopicValue(item);
-                    const label = getTopicLabel(item);
-
-                    if (!value) return null;
-
-                    return (
-                      <option key={`${value}-${index}`} value={value}>
-                        {label || value}
-                      </option>
-                    );
-                  })}
+                  {companies.map((item, index) => (
+                    <option key={`${item.value}-${index}`} value={item.value}>
+                      {item.label || item.value}
+                    </option>
+                  ))}
                 </select>
                 <p className="mt-2 text-xs text-slate-500">
-                  {isLoadingTopics
-                    ? "Loading topics from the backend..."
-                    : topicsLoaded
-                      ? `${topics.length} topics available`
-                      : "Select a topic to continue."}
+                  {isLoadingOptions
+                    ? "Loading companies from the backend..."
+                    : optionsLoaded
+                      ? `${companies.length} companies available`
+                      : "Select a company to continue."}
                 </p>
               </div>
 
               <div>
-                <label htmlFor="difficulty" className="mb-2 block text-sm font-semibold text-slate-700">
-                  Difficulty
+                <label htmlFor="role" className="mb-2 block text-sm font-semibold text-slate-700">
+                  Role
                 </label>
                 <select
-                  id="difficulty"
-                  name="difficulty"
-                  value={form.difficulty}
+                  id="role"
+                  name="role"
+                  value={form.role}
                   onChange={handleFormChange}
                   disabled={isActive || isStarting}
                   className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-3 text-sm outline-none transition focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:bg-slate-100"
+                  required
                 >
-                  <option value="Easy">Easy</option>
-                  <option value="Medium">Medium</option>
-                  <option value="Hard">Hard</option>
+                  <option value="">
+                    {isLoadingOptions ? "Loading roles..." : "Select a role"}
+                  </option>
+                  {roles.map((item, index) => (
+                    <option key={`${item.value}-${index}`} value={item.value}>
+                      {item.label || item.value}
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -864,11 +884,16 @@ export default function App() {
               <MetricCard label="Question" value={`${metrics.questionNumber}/${metrics.totalQuestions}`} />
               <MetricCard label="Score" value={metrics.score} />
               <MetricCard label="Progress" value={`${metrics.progress}%`} />
-              <MetricCard label="Difficulty" value={form.difficulty} />
+              <MetricCard label="Company" value={form.company || "—"} />
             </section>
 
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
               <h2 className="text-lg font-bold text-slate-900">Interview question</h2>
+              {(isActive || sessionStatus === "completed") && form.role && (
+                <p className="mt-1 text-sm text-slate-500">
+                  {form.role} interview{form.company ? ` · ${form.company}` : ""}
+                </p>
+              )}
               <div className="mt-5 min-h-36 rounded-xl border border-indigo-100 bg-indigo-50/60 p-5">
                 <p className="whitespace-pre-wrap text-base leading-7 text-slate-800">
                   {question || "Your first interview question will appear here after you start the interview."}
@@ -907,7 +932,7 @@ export default function App() {
               <textarea
                 value={answer}
                 onChange={(event) => updateAnswer(event.target.value)}
-                disabled={!isActive || isBusy}
+                disabled={!isActive || isBusy || isListening}
                 placeholder="Write your answer here..."
                 rows={7}
                 className="mt-5 w-full resize-y rounded-xl border border-slate-300 px-4 py-3 text-sm leading-6 outline-none transition focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:bg-slate-100"
@@ -916,6 +941,12 @@ export default function App() {
               {isListening && (
                 <p className="mt-2 text-sm font-medium text-red-600">
                   Listening for your answer...
+                </p>
+              )}
+
+              {isTranscribing && (
+                <p className="mt-2 text-sm font-medium text-indigo-600">
+                  Transcribing your answer...
                 </p>
               )}
 
@@ -1009,6 +1040,7 @@ function FeedbackValue({ label, value }) {
     </div>
   );
 }
+
 function SummaryContent({ summary }) {
   if (!summary) {
     return (
