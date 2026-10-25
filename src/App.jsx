@@ -46,6 +46,9 @@ const INITIAL_METRICS = {
 // Auto-submit after this much inactivity (typing or speaking)
 const AUTO_SUBMIT_DELAY_MS = 5000;
 
+// How often to check for finished background evaluations
+const STATUS_POLL_MS = 1500;
+
 function getMessage(error) {
   if (typeof error === "string") return error;
   return error?.message || "Something went wrong. Please try again.";
@@ -132,6 +135,8 @@ export default function App() {
   const [isFinishing, setIsFinishing] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+  const [pendingEvaluations, setPendingEvaluations] = useState(0);
   const [error, setError] = useState("");
   const [statusMessage, setStatusMessage] = useState(
     "Choose a company and role, then select Start Interview."
@@ -146,6 +151,7 @@ export default function App() {
   const answerRef = useRef("");
   const mountedRef = useRef(false);
   const submittingRef = useRef(false);
+  const lastEvalQuestionRef = useRef(0);
 
   if (!clientRef.current) {
     clientRef.current = new InterviewClient();
@@ -188,9 +194,9 @@ export default function App() {
         questionNumber,
         totalQuestions,
         score:
+          data.averageScore ??
           data.score ??
           data.totalScore ??
-          data.averageScore ??
           previous.score,
         progress:
           data.progress ??
@@ -218,6 +224,10 @@ export default function App() {
         totalQuestions: data?.totalQuestions ?? data?.maxQuestions,
         progress: data?.progress,
       });
+
+      if (typeof data?.pendingEvaluations === "number") {
+        setPendingEvaluations(data.pendingEvaluations);
+      }
 
       setSessionStatus("active");
       setIsStarting(false);
@@ -259,6 +269,7 @@ export default function App() {
     }
   }, []);
 
+  // Feedback that arrives on the answer stream (only for the last answer)
   const handleFeedback = useCallback(
     (data) => {
       if (!mountedRef.current) return;
@@ -273,16 +284,26 @@ export default function App() {
             ""
       );
 
-      if (data && typeof data === "object") {
-        updateMetrics(data);
+      // Only the running average belongs in the score card. The feedback's own
+      // questionNumber must not overwrite the "current question" counter.
+      if (data && typeof data === "object" && data.averageScore !== undefined) {
+        updateMetrics({ averageScore: data.averageScore });
       }
 
-      setIsSubmitting(false);
-      submittingRef.current = false;
       setStatusMessage("Your answer has been evaluated.");
     },
     [updateMetrics]
   );
+
+  const handleFinalizing = useCallback((data) => {
+    if (!mountedRef.current) return;
+
+    setIsGeneratingReport(true);
+    if (typeof data?.pendingEvaluations === "number") {
+      setPendingEvaluations(data.pendingEvaluations);
+    }
+    setStatusMessage("Generating your report...");
+  }, []);
 
   const handleSessionCompleted = useCallback((data) => {
     if (!mountedRef.current) return;
@@ -297,6 +318,8 @@ export default function App() {
     setIsFinishing(false);
     setIsListening(false);
     setIsTranscribing(false);
+    setIsGeneratingReport(false);
+    setPendingEvaluations(0);
     submittingRef.current = false;
     setStatusMessage("Interview completed.");
 
@@ -314,9 +337,35 @@ export default function App() {
     setIsStarting(false);
     setIsSubmitting(false);
     setIsFinishing(false);
+    setIsGeneratingReport(false);
     submittingRef.current = false;
     setStatusMessage("An error occurred.");
   }, []);
+
+  // Apply a status poll result: pending count + newly finished evaluations
+  const applyStatus = useCallback(
+    (status) => {
+      if (!mountedRef.current || !status) return;
+
+      setPendingEvaluations(status.pendingEvaluations ?? 0);
+
+      const list = Array.isArray(status.evaluations) ? status.evaluations : [];
+
+      if (list.length > 0) {
+        const latest = list[list.length - 1];
+
+        lastEvalQuestionRef.current = latest.questionNumber;
+
+        setFeedback(latest);
+        setAnswerOutput(latest.feedback || "");
+
+        if (status.averageScore !== undefined) {
+          updateMetrics({ averageScore: status.averageScore });
+        }
+      }
+    },
+    [updateMetrics]
+  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -326,6 +375,7 @@ export default function App() {
     client.onQuestion = handleQuestion;
     client.onAudio = handleAudio;
     client.onFeedback = handleFeedback;
+    client.onFinalizing = handleFinalizing;
     client.onSessionCompleted = handleSessionCompleted;
     client.onComplete = () => {
       if (!mountedRef.current) return;
@@ -351,6 +401,7 @@ export default function App() {
       client.onQuestion = null;
       client.onAudio = null;
       client.onFeedback = null;
+      client.onFinalizing = null;
       client.onSessionCompleted = null;
       client.onComplete = null;
       client.onError = null;
@@ -360,6 +411,7 @@ export default function App() {
     handleQuestion,
     handleAudio,
     handleFeedback,
+    handleFinalizing,
     handleSessionCompleted,
     handleError,
   ]);
@@ -407,6 +459,42 @@ export default function App() {
     };
   }, []);
 
+  // Poll for background evaluations while any are pending (or the report is being built)
+  useEffect(() => {
+    const shouldPoll =
+      isGeneratingReport ||
+      (sessionStatus === "active" && pendingEvaluations > 0);
+
+    if (!shouldPoll) return;
+
+    let cancelled = false;
+
+    async function poll() {
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) return;
+
+      try {
+        const status = await clientRef.current.fetchStatus(
+          sessionId,
+          lastEvalQuestionRef.current
+        );
+
+        if (cancelled) return;
+        applyStatus(status);
+      } catch {
+        // Ignore transient polling errors; the next tick will retry.
+      }
+    }
+
+    poll();
+    const timer = setInterval(poll, STATUS_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [sessionStatus, pendingEvaluations, isGeneratingReport, applyStatus]);
+
   function handleFormChange(event) {
     const { name, value } = event.target;
 
@@ -451,10 +539,13 @@ export default function App() {
     setQuestion("");
     updateAnswer("");
     clearAnswerTimer();
+    setPendingEvaluations(0);
+    setIsGeneratingReport(false);
 
     sessionIdRef.current = null;
     clientRef.current.sessionId = null;
     submittingRef.current = false;
+    lastEvalQuestionRef.current = 0;
 
     setMetrics({
       questionNumber: 0,
@@ -543,13 +634,22 @@ export default function App() {
     setIsListening(false);
     setIsTranscribing(false);
 
+    const isLastAnswer =
+      metrics.questionNumber > 0 &&
+      metrics.questionNumber >= metrics.totalQuestions;
+
     sessionIdRef.current = sessionId;
     submittingRef.current = true;
     setError("");
     setIsSubmitting(true);
-    setFeedback(null);
-    setAnswerOutput("");
-    setStatusMessage("Submitting your answer for evaluation...");
+
+    if (isLastAnswer) {
+      // Show the loading screen right away; the server confirms with "finalizing"
+      setIsGeneratingReport(true);
+      setStatusMessage("Generating your report...");
+    } else {
+      setStatusMessage("Submitting your answer...");
+    }
 
     try {
       const result = await clientRef.current.submitAnswer(
@@ -580,9 +680,10 @@ export default function App() {
 
       if (!hasResult) {
         setIsSubmitting(false);
+        setIsGeneratingReport(false);
         submittingRef.current = false;
         setStatusMessage(
-          "The answer request returned without feedback. Check the backend response."
+          "The answer request returned without a response. Check the backend."
         );
       }
     } catch (err) {
@@ -611,8 +712,9 @@ export default function App() {
     setIsListening(false);
     setIsTranscribing(false);
     setIsFinishing(true);
+    setIsGeneratingReport(true);
     setError("");
-    setStatusMessage("Finishing your interview...");
+    setStatusMessage("Generating your report...");
 
     try {
       const result = await clientRef.current.finishInterview(sessionId);
@@ -621,7 +723,8 @@ export default function App() {
         handleSessionCompleted(result);
       } else {
         setIsFinishing(false);
-        setStatusMessage("Finish request sent. Waiting for summary...");
+        setIsGeneratingReport(false);
+        setStatusMessage("Finish request sent, but no summary was returned.");
       }
     } catch (err) {
       setIsFinishing(false);
@@ -699,7 +802,12 @@ export default function App() {
   submitAnswerRef.current = submitAnswer;
 
   const isActive = sessionStatus === "active";
-  const isBusy = isStarting || isSubmitting || isFinishing || isTranscribing;
+  const isBusy =
+    isStarting ||
+    isSubmitting ||
+    isFinishing ||
+    isTranscribing ||
+    isGeneratingReport;
 
   // Auto-submit after a period of inactivity (typing or speaking)
   useEffect(() => {
@@ -715,6 +823,26 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800">
+      {isGeneratingReport && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm"
+        >
+          <div className="mx-4 w-full max-w-sm rounded-2xl bg-white p-8 text-center shadow-xl">
+            <div className="mx-auto h-12 w-12 animate-spin rounded-full border-4 border-indigo-100 border-t-indigo-600" />
+            <h2 className="mt-5 text-lg font-bold text-slate-900">
+              Generating your report...
+            </h2>
+            <p className="mt-2 text-sm text-slate-500">
+              {pendingEvaluations > 0
+                ? `Evaluating ${pendingEvaluations} remaining answer${pendingEvaluations === 1 ? "" : "s"}...`
+                : "Preparing your summary and feedback..."}
+            </p>
+          </div>
+        </div>
+      )}
+
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-4 sm:px-6 lg:px-8">
           <div>
@@ -882,7 +1010,7 @@ export default function App() {
           <div className="space-y-6 lg:col-span-2">
             <section className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <MetricCard label="Question" value={`${metrics.questionNumber}/${metrics.totalQuestions}`} />
-              <MetricCard label="Score" value={metrics.score} />
+              <MetricCard label="Avg. score" value={metrics.score} />
               <MetricCard label="Progress" value={`${metrics.progress}%`} />
               <MetricCard label="Company" value={form.company || "—"} />
             </section>
@@ -950,6 +1078,12 @@ export default function App() {
                 </p>
               )}
 
+              {isActive && pendingEvaluations > 0 && (
+                <p className="mt-2 text-xs text-slate-500">
+                  Evaluating {pendingEvaluations} answer{pendingEvaluations === 1 ? "" : "s"} in the background...
+                </p>
+              )}
+
               <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
                 <p className="text-xs text-slate-500">{answer.trim().length} characters</p>
                 <button
@@ -958,14 +1092,17 @@ export default function App() {
                   disabled={!isActive || isBusy || !answer.trim()}
                   className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {isSubmitting ? "Evaluating..." : "Submit Answer"}
+                  {isSubmitting ? "Submitting..." : "Submit Answer"}
                 </button>
               </div>
             </section>
 
             {(feedback || answerOutput) && (
               <section className="rounded-2xl border border-emerald-200 bg-white p-5 shadow-sm sm:p-6">
-                <h2 className="text-lg font-bold text-slate-900">Evaluation and feedback</h2>
+                <h2 className="text-lg font-bold text-slate-900">
+                  Evaluation and feedback
+                  {feedback?.questionNumber ? ` · Question ${feedback.questionNumber}` : ""}
+                </h2>
                 <div className="mt-4 rounded-xl bg-emerald-50 p-4">
                   <p className="whitespace-pre-wrap text-sm leading-7 text-slate-700">
                     {answerOutput || extractText(feedback) || "Your answer has been evaluated."}
@@ -975,7 +1112,10 @@ export default function App() {
                   <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
                     <FeedbackValue label="Score" value={feedback.score ?? feedback.marks} />
                     <FeedbackValue label="Result" value={feedback.result ?? feedback.rating} />
-                    <FeedbackValue label="Difficulty" value={feedback.difficulty} />
+                    <FeedbackValue
+                      label="Difficulty"
+                      value={feedback.difficulty ?? feedback.previousDifficulty}
+                    />
                   </div>
                 )}
               </section>

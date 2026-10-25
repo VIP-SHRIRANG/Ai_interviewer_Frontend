@@ -7,6 +7,7 @@ const PATHS = {
   answer: "/interview/answer",
   options: "/interview/options",
   finish: "/interview/finish",
+  status: (id, since = 0) => `/interview/${id}/status?since=${since}`, //Added a path for the status of the interview.
   report: (id) => `/interview/report/${id}`,
 };
 
@@ -24,18 +25,19 @@ export class InterviewClient {
     this.sessionId = null;
     this.onQuestion = null;
     this.onAudio = null;
+    this.onFinalizing = null; //Added a new callback to notify the client that the answer is being finalized
     this.onFeedback = null;
     this.onSessionCompleted = null;
     this.onComplete = null;
     this.onError = null;
   }
 
-  // async fetchTopics() {
-  //   const res = await fetch(`${BASE_URL}${PATHS.topics}`);
-  //   if (!res.ok) throw new Error(`Topics failed (${res.status}): ${await readError(res)}`);
-  //   return res.json(); // { topics: [...] }
-  // }
-
+  //Added a function to fetch the status of the interview session. It takes the sessionId and an optional 'since' parameter to fetch updates since a specific timestamp.
+async fetchStatus(sessionId, since = 0) {
+  const res = await fetch(`${BASE_URL}${PATHS.status(sessionId, since)}`);
+  if (!res.ok) throw new Error(`Status failed (${res.status}): ${await readError(res)}`);
+  return res.json();
+}
   async fetchOptions() {
   const res = await fetch(`${BASE_URL}${PATHS.options}`);
   if (!res.ok) throw new Error(`Options failed (${res.status}): ${await readError(res)}`);
@@ -50,15 +52,6 @@ async startInterview({ company, role, round, maxQuestions, candidateName }) {
     { resolveOnSession: true }
   );
 }
-
-  // async startInterview({ topic, difficulty, maxQuestions, candidateName }) {
-  //   this.sessionId = null;
-  //   return this._stream(
-  //     PATHS.start,
-  //     { topic, difficulty, maxQuestions, candidateName },
-  //     { resolveOnSession: true }
-  //   );
-  // }
 
   async submitAnswer(sessionId, answer) {
     return this._stream(PATHS.answer, { sessionId, answer });
@@ -165,6 +158,9 @@ async startInterview({ company, role, round, maxQuestions, candidateName }) {
         break;
       case "feedback":
         this.onFeedback?.({ ...(evt.evaluation || {}), feedback: evt.feedback });
+        break;
+      case "finalizing":
+        this.onFinalizing?.(evt);
         break;
       case "completed": {
         const s = evt.summary;
