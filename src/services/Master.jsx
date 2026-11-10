@@ -381,9 +381,6 @@ export default function Master() {
       if (!mountedRef.current) return;
 
       setIsStarting(false);
-      setIsSubmitting(false);
-      setIsFinishing(false);
-      submittingRef.current = false;
     };
     client.onError = handleError;
 
