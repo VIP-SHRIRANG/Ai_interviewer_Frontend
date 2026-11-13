@@ -1,4 +1,3 @@
-
 export class AudioPlayer {
   constructor() {
     this.queue = [];

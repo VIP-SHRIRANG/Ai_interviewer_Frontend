@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { InterviewClient } from "./InterviewClient.js";
 import { AudioPlayer } from "./audioPlayer.js";
 import { SpeechRecognitionService } from "./speechRecognition.js";
+import { getSavedName, saveName } from "./identity.js";
 
 const INITIAL_FORM = {
   candidateName: "",
@@ -39,15 +41,11 @@ const DEFAULT_ROLES = [
 const INITIAL_METRICS = {
   questionNumber: 0,
   totalQuestions: 5,
-  score: 0,
   progress: 0,
 };
 
 // Auto-submit after this much inactivity (typing or speaking)
 const AUTO_SUBMIT_DELAY_MS = 5000;
-
-// How often to check for finished background evaluations
-const STATUS_POLL_MS = 1500;
 
 function getMessage(error) {
   if (typeof error === "string") return error;
@@ -92,41 +90,19 @@ function toOptions(list) {
 const DEFAULT_COMPANY_OPTIONS = toOptions(DEFAULT_COMPANIES);
 const DEFAULT_ROLE_OPTIONS = toOptions(DEFAULT_ROLES);
 
-function extractText(data) {
-  if (typeof data === "string") return data;
-
-  return (
-    data?.question ??
-    data?.text ??
-    data?.message ??
-    data?.feedback ??
-    ""
-  );
-}
-
-function getSessionId(data) {
-  return (
-    data?.sessionId ??
-    data?.session_id ??
-    data?.session?.id ??
-    data?.data?.sessionId ??
-    data?.data?.session_id ??
-    null
-  );
-}
-
-export default function Master() {
-  const [form, setForm] = useState(INITIAL_FORM);
+export default function App() {
+  const [form, setForm] = useState(() => ({
+    ...INITIAL_FORM,
+    candidateName: getSavedName(),
+  }));
   const [companies, setCompanies] = useState(DEFAULT_COMPANY_OPTIONS);
   const [roles, setRoles] = useState(DEFAULT_ROLE_OPTIONS);
   const [optionsLoaded, setOptionsLoaded] = useState(false);
 
+  // idle | starting | active | submitted
   const [sessionStatus, setSessionStatus] = useState("idle");
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
-  const [answerOutput, setAnswerOutput] = useState("");
-  const [feedback, setFeedback] = useState(null);
-  const [summary, setSummary] = useState(null);
 
   const [metrics, setMetrics] = useState(INITIAL_METRICS);
   const [isLoadingOptions, setIsLoadingOptions] = useState(true);
@@ -135,8 +111,6 @@ export default function Master() {
   const [isFinishing, setIsFinishing] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
-  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
-  const [pendingEvaluations, setPendingEvaluations] = useState(0);
   const [error, setError] = useState("");
   const [statusMessage, setStatusMessage] = useState(
     "Choose a company and role, then select Start Interview."
@@ -146,12 +120,10 @@ export default function Master() {
   const submitAnswerRef = useRef(null);
   const audioRef = useRef(null);
   const speechRef = useRef(null);
-  const inactivityTimerRef = useRef(null);
   const sessionIdRef = useRef(null);
   const answerRef = useRef("");
   const mountedRef = useRef(false);
   const submittingRef = useRef(false);
-  const lastEvalQuestionRef = useRef(0);
 
   if (!clientRef.current) {
     clientRef.current = new InterviewClient();
@@ -165,13 +137,6 @@ export default function Master() {
     speechRef.current = new SpeechRecognitionService();
   }
 
-  const clearAnswerTimer = useCallback(() => {
-    if (inactivityTimerRef.current !== null) {
-      clearTimeout(inactivityTimerRef.current);
-      inactivityTimerRef.current = null;
-    }
-  }, []);
-
   const updateAnswer = useCallback((value) => {
     answerRef.current = value;
     setAnswer(value);
@@ -179,155 +144,83 @@ export default function Master() {
 
   const updateMetrics = useCallback((data = {}) => {
     setMetrics((previous) => {
-      const questionNumber =
-        data.questionNumber ??
-        data.currentQuestion ??
-        previous.questionNumber;
-
-      const totalQuestions =
-        data.totalQuestions ??
-        data.maxQuestions ??
-        previous.totalQuestions;
+      const questionNumber = data.questionNumber ?? previous.questionNumber;
+      const totalQuestions = data.maxQuestions ?? previous.totalQuestions;
 
       return {
-        ...previous,
         questionNumber,
         totalQuestions,
-        score:
-          data.averageScore ??
-          data.score ??
-          data.totalScore ??
-          previous.score,
         progress:
-          data.progress ??
-          (questionNumber && totalQuestions
+          questionNumber && totalQuestions
             ? Math.round((questionNumber / totalQuestions) * 100)
-            : previous.progress),
+            : previous.progress,
       };
     });
   }, []);
 
-  const handleQuestion = useCallback(
-    (data) => {
-      if (!mountedRef.current) return;
-
-      const nextQuestion = extractText(data);
-      if (!nextQuestion) return;
-
-      clearAnswerTimer();
-
-      setQuestion(nextQuestion);
-      updateAnswer("");
-
-      updateMetrics({
-        questionNumber: data?.questionNumber ?? data?.currentQuestion,
-        totalQuestions: data?.totalQuestions ?? data?.maxQuestions,
-        progress: data?.progress,
-      });
-
-      if (typeof data?.pendingEvaluations === "number") {
-        setPendingEvaluations(data.pendingEvaluations);
-      }
-
-      setSessionStatus("active");
-      setIsStarting(false);
-      setIsSubmitting(false);
-      submittingRef.current = false;
-      setStatusMessage("Your next interview question is ready.");
-
-      const audioData = data?.audio ?? data?.audioBase64;
-
-      if (audioData) {
-        const player = audioRef.current;
-
-        if (typeof player?.enqueue === "function") {
-          player.enqueue(audioData);
-        } else if (typeof player?.play === "function") {
-          player.play(audioData);
-        }
-      }
-    },
-    [clearAnswerTimer, updateAnswer, updateMetrics]
-  );
-
-  const handleAudio = useCallback((data) => {
-    if (!mountedRef.current || !data) return;
-
-    const audioData =
-      typeof data === "string"
-        ? data
-        : data.audio ?? data.audioBase64 ?? data.data;
-
+  const playAudio = useCallback((audioData) => {
     if (!audioData) return;
 
     const player = audioRef.current;
 
     if (typeof player?.enqueue === "function") {
       player.enqueue(audioData);
-    } else if (typeof player?.play === "function") {
-      player.play(audioData);
     }
   }, []);
 
-  // Feedback that arrives on the answer stream (only for the last answer)
-  const handleFeedback = useCallback(
+  const handleQuestion = useCallback(
     (data) => {
       if (!mountedRef.current) return;
 
-      setFeedback(data);
-      setAnswerOutput(
-        typeof data === "string"
-          ? data
-          : data?.feedback ??
-            data?.message ??
-            data?.evaluation ??
-            ""
-      );
+      const nextQuestion = data?.question;
+      if (!nextQuestion) return;
 
-      // Only the running average belongs in the score card. The feedback's own
-      // questionNumber must not overwrite the "current question" counter.
-      if (data && typeof data === "object" && data.averageScore !== undefined) {
-        updateMetrics({ averageScore: data.averageScore });
-      }
+      setQuestion(nextQuestion);
+      updateAnswer("");
+      updateMetrics({
+        questionNumber: data.questionNumber,
+        maxQuestions: data.maxQuestions,
+      });
 
-      setStatusMessage("Your answer has been evaluated.");
+      if (data.sessionId) sessionIdRef.current = data.sessionId;
+
+      setSessionStatus("active");
+      setIsStarting(false);
+      setIsSubmitting(false);
+      submittingRef.current = false;
+      setStatusMessage("Your next interview question is ready.");
     },
-    [updateMetrics]
+    [updateAnswer, updateMetrics]
   );
 
-  const handleFinalizing = useCallback((data) => {
+  const handleAudio = useCallback(
+    (data) => {
+      if (!mountedRef.current) return;
+      playAudio(data?.audio);
+    },
+    [playAudio]
+  );
+
+  // The interview was handed to the evaluation queue
+  const handleSubmitted = useCallback((data) => {
     if (!mountedRef.current) return;
 
-    setIsGeneratingReport(true);
-    if (typeof data?.pendingEvaluations === "number") {
-      setPendingEvaluations(data.pendingEvaluations);
-    }
-    setStatusMessage("Generating your report...");
-  }, []);
-
-  const handleSessionCompleted = useCallback((data) => {
-    if (!mountedRef.current) return;
-
-    clearTimeout(inactivityTimerRef.current);
-    inactivityTimerRef.current = null;
-
-    setSummary(data?.summary ?? data?.report ?? data ?? null);
-    setSessionStatus("completed");
-    setIsStarting(false);
-    setIsSubmitting(false);
-    setIsFinishing(false);
-    setIsListening(false);
-    setIsTranscribing(false);
-    setIsGeneratingReport(false);
-    setPendingEvaluations(0);
-    submittingRef.current = false;
-    setStatusMessage("Interview completed.");
+    if (data?.sessionId) sessionIdRef.current = data.sessionId;
 
     try {
       speechRef.current?.cancel?.();
     } catch {
       // Ignore speech cleanup errors.
     }
+
+    setSessionStatus("submitted");
+    setIsStarting(false);
+    setIsSubmitting(false);
+    setIsFinishing(false);
+    setIsListening(false);
+    setIsTranscribing(false);
+    submittingRef.current = false;
+    setStatusMessage("Interview submitted.");
   }, []);
 
   const handleError = useCallback((err) => {
@@ -337,35 +230,9 @@ export default function Master() {
     setIsStarting(false);
     setIsSubmitting(false);
     setIsFinishing(false);
-    setIsGeneratingReport(false);
     submittingRef.current = false;
     setStatusMessage("An error occurred.");
   }, []);
-
-  // Apply a status poll result: pending count + newly finished evaluations
-  const applyStatus = useCallback(
-    (status) => {
-      if (!mountedRef.current || !status) return;
-
-      setPendingEvaluations(status.pendingEvaluations ?? 0);
-
-      const list = Array.isArray(status.evaluations) ? status.evaluations : [];
-
-      if (list.length > 0) {
-        const latest = list[list.length - 1];
-
-        lastEvalQuestionRef.current = latest.questionNumber;
-
-        setFeedback(latest);
-        setAnswerOutput(latest.feedback || "");
-
-        if (status.averageScore !== undefined) {
-          updateMetrics({ averageScore: status.averageScore });
-        }
-      }
-    },
-    [updateMetrics]
-  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -374,19 +241,15 @@ export default function Master() {
 
     client.onQuestion = handleQuestion;
     client.onAudio = handleAudio;
-    client.onFeedback = handleFeedback;
-    client.onFinalizing = handleFinalizing;
-    client.onSessionCompleted = handleSessionCompleted;
+    client.onSubmitted = handleSubmitted;
     client.onComplete = () => {
       if (!mountedRef.current) return;
-
       setIsStarting(false);
     };
     client.onError = handleError;
 
     return () => {
       mountedRef.current = false;
-      clearAnswerTimer();
 
       try {
         speechRef.current?.cancel?.();
@@ -397,21 +260,11 @@ export default function Master() {
 
       client.onQuestion = null;
       client.onAudio = null;
-      client.onFeedback = null;
-      client.onFinalizing = null;
-      client.onSessionCompleted = null;
+      client.onSubmitted = null;
       client.onComplete = null;
       client.onError = null;
     };
-  }, [
-    clearAnswerTimer,
-    handleQuestion,
-    handleAudio,
-    handleFeedback,
-    handleFinalizing,
-    handleSessionCompleted,
-    handleError,
-  ]);
+  }, [handleQuestion, handleAudio, handleSubmitted, handleError]);
 
   // Load company / role lists from the backend (falls back to the defaults)
   useEffect(() => {
@@ -421,14 +274,12 @@ export default function Master() {
       setIsLoadingOptions(true);
 
       try {
-        const result = await clientRef.current.fetchOptions?.();
+        const result = await clientRef.current.fetchOptions();
 
         if (cancelled) return;
 
-        const companyList = toOptions(
-          result?.companies ?? result?.data?.companies
-        );
-        const roleList = toOptions(result?.roles ?? result?.data?.roles);
+        const companyList = toOptions(result?.companies);
+        const roleList = toOptions(result?.roles);
 
         setCompanies(
           companyList.length > 0 ? companyList : DEFAULT_COMPANY_OPTIONS
@@ -455,42 +306,6 @@ export default function Master() {
       cancelled = true;
     };
   }, []);
-
-  // Poll for background evaluations while any are pending (or the report is being built)
-  useEffect(() => {
-    const shouldPoll =
-      isGeneratingReport ||
-      (sessionStatus === "active" && pendingEvaluations > 0);
-
-    if (!shouldPoll) return;
-
-    let cancelled = false;
-
-    async function poll() {
-      const sessionId = sessionIdRef.current;
-      if (!sessionId) return;
-
-      try {
-        const status = await clientRef.current.fetchStatus(
-          sessionId,
-          lastEvalQuestionRef.current
-        );
-
-        if (cancelled) return;
-        applyStatus(status);
-      } catch {
-        // Ignore transient polling errors; the next tick will retry.
-      }
-    }
-
-    poll();
-    const timer = setInterval(poll, STATUS_POLL_MS);
-
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [sessionStatus, pendingEvaluations, isGeneratingReport, applyStatus]);
 
   function handleFormChange(event) {
     const { name, value } = event.target;
@@ -529,25 +344,19 @@ export default function Master() {
       return;
     }
 
+    saveName(candidateName);
+
     setError("");
-    setSummary(null);
-    setFeedback(null);
-    setAnswerOutput("");
     setQuestion("");
     updateAnswer("");
-    clearAnswerTimer();
-    setPendingEvaluations(0);
-    setIsGeneratingReport(false);
 
     sessionIdRef.current = null;
     clientRef.current.sessionId = null;
     submittingRef.current = false;
-    lastEvalQuestionRef.current = 0;
 
     setMetrics({
       questionNumber: 0,
       totalQuestions: form.maxQuestions,
-      score: 0,
       progress: 0,
     });
 
@@ -563,30 +372,17 @@ export default function Master() {
         candidateName,
       });
 
-      const newSessionId =
-        getSessionId(result) ?? clientRef.current.sessionId;
+      sessionIdRef.current =
+        result?.sessionId ?? clientRef.current.sessionId ?? sessionIdRef.current;
 
-      if (newSessionId) {
-        sessionIdRef.current = newSessionId;
-      } else {
+      if (!sessionIdRef.current) {
         setSessionStatus("idle");
         setIsStarting(false);
-        setError(
-          "The backend did not return a session ID. Check the /interview/start response and streaming events."
-        );
+        setError("The backend did not return a session ID. Please try again.");
         return;
       }
 
       setIsStarting(false);
-
-      if (result?.question || result?.data?.question) {
-        handleQuestion(result?.data ?? result);
-      } else if (!result?.streamed) {
-        setSessionStatus((previous) =>
-          previous === "starting" ? "active" : previous
-        );
-        setStatusMessage("Interview started. Waiting for a question...");
-      }
     } catch (err) {
       setSessionStatus("idle");
       setIsStarting(false);
@@ -595,8 +391,6 @@ export default function Master() {
   }
 
   async function submitAnswer({ automatic = false } = {}) {
-    clearAnswerTimer();
-
     if (submittingRef.current) return;
 
     if (sessionStatus !== "active") {
@@ -604,13 +398,10 @@ export default function Master() {
       return;
     }
 
-    const sessionId =
-      sessionIdRef.current ?? clientRef.current?.sessionId;
+    const sessionId = sessionIdRef.current ?? clientRef.current?.sessionId;
 
     if (!sessionId) {
-      setError(
-        "Interview session ID is missing. Please start a new interview."
-      );
+      setError("Interview session ID is missing. Please start a new interview.");
       return;
     }
 
@@ -631,58 +422,14 @@ export default function Master() {
     setIsListening(false);
     setIsTranscribing(false);
 
-    const isLastAnswer =
-      metrics.questionNumber > 0 &&
-      metrics.questionNumber >= metrics.totalQuestions;
-
-    sessionIdRef.current = sessionId;
     submittingRef.current = true;
     setError("");
     setIsSubmitting(true);
-
-    if (isLastAnswer) {
-      // Show the loading screen right away; the server confirms with "finalizing"
-      setIsGeneratingReport(true);
-      setStatusMessage("Generating your report...");
-    } else {
-      setStatusMessage("Submitting your answer...");
-    }
+    setStatusMessage("Saving your answer...");
 
     try {
-      const result = await clientRef.current.submitAnswer(
-        sessionId,
-        finalAnswer
-      );
-
-      if (result?.feedback || result?.evaluation) {
-        handleFeedback(result.feedback ?? result.evaluation);
-      }
-
-      if (result?.question || result?.data?.question) {
-        handleQuestion(result?.data ?? result);
-      }
-
-      if (result?.completed || result?.sessionCompleted) {
-        handleSessionCompleted(result);
-      }
-
-      const hasResult =
-        result?.streamed ||
-        result?.feedback ||
-        result?.evaluation ||
-        result?.question ||
-        result?.data?.question ||
-        result?.completed ||
-        result?.sessionCompleted;
-
-      if (!hasResult) {
-        setIsSubmitting(false);
-        setIsGeneratingReport(false);
-        submittingRef.current = false;
-        setStatusMessage(
-          "The answer request returned without a response. Check the backend."
-        );
-      }
+      await clientRef.current.submitAnswer(sessionId, finalAnswer);
+      // The next question (or the "submitted" event) arrives through the callbacks.
     } catch (err) {
       setIsSubmitting(false);
       submittingRef.current = false;
@@ -691,14 +438,20 @@ export default function Master() {
   }
 
   async function finishInterview() {
-    const sessionId =
-      sessionIdRef.current ?? clientRef.current?.sessionId;
+    const sessionId = sessionIdRef.current ?? clientRef.current?.sessionId;
 
     if (isFinishing || !sessionId || sessionStatus !== "active") {
       return;
     }
 
-    clearAnswerTimer();
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm(
+        "Finish now? Only the questions you have answered will be evaluated."
+      )
+    ) {
+      return;
+    }
 
     try {
       speechRef.current?.cancel?.();
@@ -709,49 +462,34 @@ export default function Master() {
     setIsListening(false);
     setIsTranscribing(false);
     setIsFinishing(true);
-    setIsGeneratingReport(true);
     setError("");
-    setStatusMessage("Generating your report...");
+    setStatusMessage("Submitting your interview...");
 
     try {
-      const result = await clientRef.current.finishInterview(sessionId);
-
-      if (result?.summary || result?.report || result?.completed) {
-        handleSessionCompleted(result);
-      } else {
-        setIsFinishing(false);
-        setIsGeneratingReport(false);
-        setStatusMessage("Finish request sent, but no summary was returned.");
-      }
+      await clientRef.current.finishInterview(sessionId);
+      handleSubmitted({ sessionId });
     } catch (err) {
       setIsFinishing(false);
       handleError(err);
     }
   }
 
-  async function downloadReport() {
-    const sessionId =
-      sessionIdRef.current ?? clientRef.current?.sessionId;
-
-    if (!sessionId) {
-      setError("No interview session is available for the report.");
-      return;
-    }
-
+  function startAnother() {
+    sessionIdRef.current = null;
+    clientRef.current.sessionId = null;
+    setQuestion("");
+    updateAnswer("");
     setError("");
-
-    try {
-      await clientRef.current.downloadReport(sessionId);
-    } catch (err) {
-      handleError(err);
-    }
+    setMetrics(INITIAL_METRICS);
+    setSessionStatus("idle");
+    setStatusMessage("Choose a company and role, then select Start Interview.");
   }
 
   async function toggleSpeechRecognition() {
     const speech = speechRef.current;
 
     if (isListening) {
-      speech?.stop(); // finish recording, then transcribe
+      speech?.stop(); // finish listening and keep the last words
       return;
     }
 
@@ -786,9 +524,6 @@ export default function Master() {
           if (state === "recording") {
             setStatusMessage("Listening... speak your answer.");
           }
-          if (state === "transcribing") {
-            setStatusMessage("Transcribing your answer...");
-          }
         }
       );
     } catch (err) {
@@ -799,16 +534,12 @@ export default function Master() {
   submitAnswerRef.current = submitAnswer;
 
   const isActive = sessionStatus === "active";
-  const isBusy =
-    isStarting ||
-    isSubmitting ||
-    isFinishing ||
-    isTranscribing ||
-    isGeneratingReport;
+  const isSubmitted = sessionStatus === "submitted";
+  const isBusy = isStarting || isSubmitting || isFinishing || isTranscribing;
 
   // Auto-submit after a period of inactivity (typing or speaking)
   useEffect(() => {
-    if (!isActive || isBusy || isListening || !answer.trim()) return;
+    if (!isActive || isBusy || !answer.trim()) return;
 
     const timer = setTimeout(() => {
       submitAnswerRef.current?.({ automatic: true });
@@ -816,30 +547,10 @@ export default function Master() {
 
     // Any change to `answer` cancels this timer and starts a new one
     return () => clearTimeout(timer);
-  }, [answer, isActive, isBusy, isListening]);
+  }, [answer, isActive, isBusy]);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800">
-      {isGeneratingReport && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm"
-        >
-          <div className="mx-4 w-full max-w-sm rounded-2xl bg-white p-8 text-center shadow-xl">
-            <div className="mx-auto h-12 w-12 animate-spin rounded-full border-4 border-indigo-100 border-t-indigo-600" />
-            <h2 className="mt-5 text-lg font-bold text-slate-900">
-              Generating your report...
-            </h2>
-            <p className="mt-2 text-sm text-slate-500">
-              {pendingEvaluations > 0
-                ? `Evaluating ${pendingEvaluations} remaining answer${pendingEvaluations === 1 ? "" : "s"}...`
-                : "Preparing your summary and feedback..."}
-            </p>
-          </div>
-        </div>
-      )}
-
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-4 sm:px-6 lg:px-8">
           <div>
@@ -851,13 +562,21 @@ export default function Master() {
             </p>
           </div>
 
-          <span className="rounded-full bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700">
-            {isActive
-              ? "Interview in progress"
-              : sessionStatus === "completed"
-                ? "Completed"
-                : "Practice mode"}
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="rounded-full bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700">
+              {isActive
+                ? "Interview in progress"
+                : isSubmitted
+                  ? "Submitted"
+                  : "Practice mode"}
+            </span>
+            <Link
+              to="/dashboard"
+              className="rounded-xl border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+            >
+              My interviews
+            </Link>
+          </div>
         </div>
       </header>
 
@@ -867,7 +586,7 @@ export default function Master() {
             Prepare for your next interview
           </h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
-            Choose a company and role, answer questions, and review your interview feedback.
+            Choose a company and role and answer the questions. Your report is prepared after the interview and appears under "My interviews".
           </p>
         </div>
 
@@ -996,152 +715,120 @@ export default function Master() {
               <button
                 type="button"
                 onClick={finishInterview}
-                disabled={!isActive || isFinishing}
+                disabled={!isActive || isFinishing || isSubmitting}
                 className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3 font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {isFinishing ? "Finishing..." : "Finish Interview"}
+                {isFinishing ? "Submitting..." : "Finish Interview"}
               </button>
             </form>
           </section>
 
           <div className="space-y-6 lg:col-span-2">
-            <section className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-              <MetricCard label="Question" value={`${metrics.questionNumber}/${metrics.totalQuestions}`} />
-              <MetricCard label="Avg. score" value={metrics.score} />
-              <MetricCard label="Progress" value={`${metrics.progress}%`} />
-              <MetricCard label="Company" value={form.company || "—"} />
-            </section>
-
-            <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-              <h2 className="text-lg font-bold text-slate-900">Interview question</h2>
-              {(isActive || sessionStatus === "completed") && form.role && (
-                <p className="mt-1 text-sm text-slate-500">
-                  {form.role} interview{form.company ? ` · ${form.company}` : ""}
-                </p>
-              )}
-              <div className="mt-5 min-h-36 rounded-xl border border-indigo-100 bg-indigo-50/60 p-5">
-                <p className="whitespace-pre-wrap text-base leading-7 text-slate-800">
-                  {question || "Your first interview question will appear here after you start the interview."}
-                </p>
-              </div>
-              <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-100">
-                <div
-                  className="h-full rounded-full bg-indigo-600 transition-all duration-500"
-                  style={{ width: `${Math.min(100, Math.max(0, metrics.progress))}%` }}
-                />
-              </div>
-            </section>
-
-            <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-lg font-bold text-slate-900">Your answer</h2>
-                  <p className="mt-1 text-sm text-slate-500">
-                    Type your answer or use speech recognition.
-                  </p>
+            {isSubmitted ? (
+              <section className="rounded-2xl border border-emerald-200 bg-white p-8 text-center shadow-sm">
+                <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-emerald-100 text-2xl text-emerald-600">
+                  ✓
                 </div>
-                <button
-                  type="button"
-                  onClick={toggleSpeechRecognition}
-                  disabled={!isActive || isBusy}
-                  className={`rounded-xl px-4 py-2.5 text-sm font-semibold transition disabled:opacity-50 ${
-                    isListening
-                      ? "bg-red-100 text-red-700 hover:bg-red-200"
-                      : "bg-slate-100 text-slate-700 hover:bg-slate-200"
-                  }`}
-                >
-                  {isListening ? "Stop listening" : "Use microphone"}
-                </button>
-              </div>
-
-              <textarea
-                value={answer}
-                onChange={(event) => updateAnswer(event.target.value)}
-                disabled={!isActive || isBusy || isListening}
-                placeholder="Write your answer here..."
-                rows={7}
-                className="mt-5 w-full resize-y rounded-xl border border-slate-300 px-4 py-3 text-sm leading-6 outline-none transition focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:bg-slate-100"
-              />
-
-              {isListening && (
-                <p className="mt-2 text-sm font-medium text-red-600">
-                  Listening for your answer...
-                </p>
-              )}
-
-              {isTranscribing && (
-                <p className="mt-2 text-sm font-medium text-indigo-600">
-                  Transcribing your answer...
-                </p>
-              )}
-
-              {isActive && pendingEvaluations > 0 && (
-                <p className="mt-2 text-xs text-slate-500">
-                  Evaluating {pendingEvaluations} answer{pendingEvaluations === 1 ? "" : "s"} in the background...
-                </p>
-              )}
-
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-                <p className="text-xs text-slate-500">{answer.trim().length} characters</p>
-                <button
-                  type="button"
-                  onClick={() => submitAnswer()}
-                  disabled={!isActive || isBusy || !answer.trim()}
-                  className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {isSubmitting ? "Submitting..." : "Submit Answer"}
-                </button>
-              </div>
-            </section>
-
-            {(feedback || answerOutput) && (
-              <section className="rounded-2xl border border-emerald-200 bg-white p-5 shadow-sm sm:p-6">
-                <h2 className="text-lg font-bold text-slate-900">
-                  Evaluation and feedback
-                  {feedback?.questionNumber ? ` · Question ${feedback.questionNumber}` : ""}
+                <h2 className="mt-5 text-xl font-bold text-slate-900">
+                  Interview submitted
                 </h2>
-                <div className="mt-4 rounded-xl bg-emerald-50 p-4">
-                  <p className="whitespace-pre-wrap text-sm leading-7 text-slate-700">
-                    {answerOutput || extractText(feedback) || "Your answer has been evaluated."}
-                  </p>
-                </div>
-                {feedback && typeof feedback === "object" && (
-                  <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
-                    <FeedbackValue label="Score" value={feedback.score ?? feedback.marks} />
-                    <FeedbackValue label="Result" value={feedback.result ?? feedback.rating} />
-                    <FeedbackValue
-                      label="Difficulty"
-                      value={feedback.difficulty ?? feedback.previousDifficulty}
-                    />
-                  </div>
-                )}
-              </section>
-            )}
-
-            {sessionStatus === "completed" && (
-              <section className="rounded-2xl border border-indigo-200 bg-white p-5 shadow-sm sm:p-6">
-                <h2 className="text-lg font-bold text-slate-900">Interview summary</h2>
-                <p className="mt-1 text-sm text-slate-500">
-                  Your session is complete. Review the result below or download your report.
+                <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-slate-600">
+                  Well done. Your answers are being evaluated and your report will be ready soon. You do not need to wait here: check the status any time under "My interviews".
                 </p>
-                <SummaryContent summary={summary} />
-                <div className="mt-5 flex flex-wrap gap-3">
-                  <button
-                    type="button"
-                    onClick={downloadReport}
+                <div className="mt-6 flex flex-wrap justify-center gap-3">
+                  <Link
+                    to="/dashboard"
                     className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white transition hover:bg-indigo-700"
                   >
-                    Download PDF report
-                  </button>
+                    View my interviews
+                  </Link>
                   <button
                     type="button"
-                    onClick={() => window.print()}
+                    onClick={startAnother}
                     className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
                   >
-                    Print page
+                    Start another interview
                   </button>
                 </div>
               </section>
+            ) : (
+              <>
+                <section className="grid grid-cols-2 gap-4 sm:grid-cols-3">
+                  <MetricCard label="Question" value={`${metrics.questionNumber}/${metrics.totalQuestions}`} />
+                  <MetricCard label="Progress" value={`${metrics.progress}%`} />
+                  <MetricCard label="Company" value={form.company || "—"} />
+                </section>
+
+                <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                  <h2 className="text-lg font-bold text-slate-900">Interview question</h2>
+                  {isActive && form.role && (
+                    <p className="mt-1 text-sm text-slate-500">
+                      {form.role} interview{form.company ? ` · ${form.company}` : ""}
+                    </p>
+                  )}
+                  <div className="mt-5 min-h-36 rounded-xl border border-indigo-100 bg-indigo-50/60 p-5">
+                    <p className="whitespace-pre-wrap text-base leading-7 text-slate-800">
+                      {question || "Your first interview question will appear here after you start the interview."}
+                    </p>
+                  </div>
+                  <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-100">
+                    <div
+                      className="h-full rounded-full bg-indigo-600 transition-all duration-500"
+                      style={{ width: `${Math.min(100, Math.max(0, metrics.progress))}%` }}
+                    />
+                  </div>
+                </section>
+
+                <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h2 className="text-lg font-bold text-slate-900">Your answer</h2>
+                      <p className="mt-1 text-sm text-slate-500">
+                        Type your answer or use speech recognition.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={toggleSpeechRecognition}
+                      disabled={!isActive || isBusy}
+                      className={`rounded-xl px-4 py-2.5 text-sm font-semibold transition disabled:opacity-50 ${
+                        isListening
+                          ? "bg-red-100 text-red-700 hover:bg-red-200"
+                          : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                      }`}
+                    >
+                      {isListening ? "Stop listening" : "Use microphone"}
+                    </button>
+                  </div>
+
+                  <textarea
+                    value={answer}
+                    onChange={(event) => updateAnswer(event.target.value)}
+                    disabled={!isActive || isBusy || isListening}
+                    placeholder="Write your answer here..."
+                    rows={7}
+                    className="mt-5 w-full resize-y rounded-xl border border-slate-300 px-4 py-3 text-sm leading-6 outline-none transition focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:bg-slate-100"
+                  />
+
+                  {isListening && (
+                    <p className="mt-2 text-sm font-medium text-red-600">
+                      Listening for your answer...
+                    </p>
+                  )}
+
+                  <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                    <p className="text-xs text-slate-500">{answer.trim().length} characters</p>
+                    <button
+                      type="button"
+                      onClick={() => submitAnswer()}
+                      disabled={!isActive || isBusy || !answer.trim()}
+                      className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isSubmitting ? "Saving..." : "Submit Answer"}
+                    </button>
+                  </div>
+                </section>
+              </>
             )}
           </div>
         </div>
@@ -1161,69 +848,6 @@ function MetricCard({ label, value }) {
       <p className="mt-2 break-words text-xl font-bold text-slate-900">
         {value ?? "—"}
       </p>
-    </div>
-  );
-}
-
-function FeedbackValue({ label, value }) {
-  if (value === undefined || value === null || value === "") return null;
-
-  return (
-    <div className="rounded-xl border border-slate-200 p-3">
-      <p className="text-xs text-slate-500">{label}</p>
-      <p className="mt-1 break-words text-sm font-semibold text-slate-800">
-        {String(value)}
-      </p>
-    </div>
-  );
-}
-
-function SummaryContent({ summary }) {
-  if (!summary) {
-    return (
-      <p className="mt-4 text-sm text-slate-600">
-        Your final summary will appear here when the backend returns it.
-      </p>
-    );
-  }
-
-  if (typeof summary === "string") {
-    return (
-      <p className="mt-4 whitespace-pre-wrap text-sm leading-7 text-slate-700">
-        {summary}
-      </p>
-    );
-  }
-
-  const entries = Object.entries(summary).filter(
-    ([, value]) =>
-      value !== undefined &&
-      value !== null &&
-      typeof value !== "object"
-  );
-
-  return (
-    <div className="mt-4 grid gap-3 sm:grid-cols-2">
-      {entries.length > 0 ? (
-        entries.map(([key, value]) => (
-          <div
-            key={key}
-            className="rounded-xl border border-slate-200 p-4"
-          >
-            <p className="text-xs font-medium capitalize text-slate-500">
-              {key.replace(/([A-Z])/g, " $1").replace(/[_-]/g, " ")}
-            </p>
-
-            <p className="mt-2 whitespace-pre-wrap break-words text-sm font-semibold text-slate-800">
-              {String(value)}
-            </p>
-          </div>
-        ))
-      ) : (
-        <p className="text-sm text-slate-600">
-          Interview completed. No summary details were provided.
-        </p>
-      )}
     </div>
   );
 }
